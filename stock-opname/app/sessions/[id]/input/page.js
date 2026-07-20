@@ -15,7 +15,14 @@ export default function InputPage() {
   const materialInputRef = useRef(null);
   const nomorRakRef = useRef(null);
 
+  // Recount mode: pulled from so_sessions. Kalau recountMaterials.length > 0,
+  // petugas hanya boleh input material yang ada di daftar ini.
+  const [activeRecountRound, setActiveRecountRound] = useState(0);
+  const [recountMaterials, setRecountMaterials] = useState([]); // string[] material codes
+  const recountMode = recountMaterials.length > 0;
+
   const [materialCode, setMaterialCode] = useState('');
+  const [showRecountSuggestions, setShowRecountSuggestions] = useState(false);
   const [lookupState, setLookupState] = useState('idle'); // idle | searching | found | notfound
   const [batchOptions, setBatchOptions] = useState([]); // sap rows sharing the material code
   const [selectedRow, setSelectedRow] = useState(null); // chosen sap row (or null if not-in-SAP)
@@ -40,6 +47,7 @@ export default function InputPage() {
       return;
     }
     setPetugas(saved);
+    loadSessionRecountState();
 
     // Pull the UoM options straight from this session's Data SAP so the
     // dropdown always matches Master Data instead of relying on free text.
@@ -53,12 +61,33 @@ export default function InputPage() {
       });
   }, [id, router]);
 
+  async function loadSessionRecountState() {
+    const { data } = await supabase
+      .from('so_sessions')
+      .select('active_recount_round, recount_material_codes')
+      .eq('id', id)
+      .single();
+    if (data) {
+      setActiveRecountRound(data.active_recount_round || 0);
+      setRecountMaterials(data.recount_material_codes || []);
+    }
+  }
+
   async function handleMaterialKeyDown(e) {
     if (e.key !== 'Enter') return;
     e.preventDefault();
-    const code = materialCode.trim();
+    await runMaterialLookup(materialCode.trim());
+  }
+
+  async function runMaterialLookup(code) {
     if (!code) return;
 
+    if (recountMode && !recountMaterials.includes(code)) {
+      setError(`Material "${code}" tidak sedang di-recount. Pilih dari daftar yang tersedia.`);
+      return;
+    }
+
+    setShowRecountSuggestions(false);
     setLookupState('searching');
     setError(null);
     const { data, error } = await supabase
@@ -130,12 +159,19 @@ export default function InputPage() {
     setKondisiBarang('Normal');
     setCatatan('');
     setTimeout(() => materialInputRef.current?.focus(), 50);
+    // Refresh recount state in case Accounting started/stopped recount
+    // while petugas was mid-session.
+    loadSessionRecountState();
   }
 
   async function handleSave(e) {
     e.preventDefault();
     setError(null);
 
+    if (recountMode && !recountMaterials.includes(materialCode.trim())) {
+      setError('Material ini tidak sedang di-recount. Pilih dari daftar yang tersedia.');
+      return;
+    }
     if (lookupState !== 'found' && statusSap !== 'tidak_ada_di_sap') {
       setError('Cari Material Code terlebih dahulu (tekan Enter).');
       return;
@@ -177,6 +213,9 @@ export default function InputPage() {
       kondisi_barang: kondisiBarang,
       catatan: catatan.trim() || null,
       status_sap: statusSap,
+      // Di-stamp otomatis dari session — petugas tidak perlu tahu/pilih
+      // round-nya, Accounting yang mengontrol lewat tombol "Mulai Recount".
+      recount_round: recountMode ? activeRecountRound : 0,
     };
 
     const { error } = await supabase.from('so_entries').insert(record);
@@ -185,12 +224,16 @@ export default function InputPage() {
       setError(error.message);
       return;
     }
-    setLastSaved(record);
+    setLastSaved({ ...record, isRecount: recountMode });
     resetForm();
   }
 
   const showBatchPicker = lookupState === 'found' && batchOptions.length > 1 && !selectedRow;
   const showDetails = selectedRow || statusSap === 'tidak_ada_di_sap';
+
+  const filteredRecountSuggestions = recountMode
+    ? recountMaterials.filter((m) => m.toLowerCase().includes(materialCode.trim().toLowerCase())).slice(0, 8)
+    : [];
 
   return (
     <div className="mx-auto max-w-lg space-y-4">
@@ -202,26 +245,67 @@ export default function InputPage() {
         <div className="badge bg-slate-850/10 text-ink">{petugas}</div>
       </div>
 
+      {recountMode && (
+        <div className="card border-warn/40 bg-warn/10 p-3.5 text-sm">
+          <div className="font-medium text-warn">🔄 Mode Recount aktif (Round {activeRecountRound})</div>
+          <p className="mt-1 text-ink/60">
+            Hanya {recountMaterials.length} material yang selisih yang bisa di-input sekarang.
+            Material lain otomatis ditolak.
+          </p>
+        </div>
+      )}
+
       {lastSaved && (
-        <div className="card border-good/30 bg-good/5 p-3 text-sm text-good">
-          Tersimpan: {lastSaved.material_code} · Rak {lastSaved.nomor_rak} · Qty {lastSaved.qty_fisik}{lastSaved.base_uom ? ` ${lastSaved.base_uom}` : ''}
+        <div className={`card p-3 text-sm ${lastSaved.isRecount ? 'border-warn/30 bg-warn/5 text-warn' : 'border-good/30 bg-good/5 text-good'}`}>
+          {lastSaved.isRecount && '🔄 '}Tersimpan: {lastSaved.material_code} · Rak {lastSaved.nomor_rak} · Qty {lastSaved.qty_fisik}{lastSaved.base_uom ? ` ${lastSaved.base_uom}` : ''}
         </div>
       )}
 
       <form onSubmit={handleSave} className="card space-y-4 p-5">
-        <div>
+        <div className="relative">
           <label className="label-field">Material Code</label>
           <input
             ref={materialInputRef}
             className="input-field font-mono"
             value={materialCode}
-            onChange={(e) => setMaterialCode(e.target.value)}
+            onChange={(e) => {
+              setMaterialCode(e.target.value);
+              if (recountMode) setShowRecountSuggestions(true);
+            }}
+            onFocus={() => recountMode && setShowRecountSuggestions(true)}
+            onBlur={() => setTimeout(() => setShowRecountSuggestions(false), 150)}
             onKeyDown={handleMaterialKeyDown}
-            placeholder="Ketik atau scan, lalu Enter"
+            placeholder={recountMode ? 'Cari material yang selisih...' : 'Ketik atau scan, lalu Enter'}
             autoFocus
           />
           {lookupState === 'searching' && (
             <div className="mt-1.5 text-xs text-ink/50">Mencari...</div>
+          )}
+
+          {/* Recount mode: searchable dropdown restricted to selisih materials only */}
+          {recountMode && showRecountSuggestions && filteredRecountSuggestions.length > 0 && (
+            <ul className="absolute z-10 mt-1 max-h-56 w-full overflow-auto rounded-lg border border-line bg-white shadow-lg">
+              {filteredRecountSuggestions.map((code) => (
+                <li key={code}>
+                  <button
+                    type="button"
+                    className="block w-full px-3 py-2 text-left font-mono text-sm hover:bg-paper"
+                    onMouseDown={(e) => {
+                      e.preventDefault();
+                      setMaterialCode(code);
+                      runMaterialLookup(code);
+                    }}
+                  >
+                    {code}
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+          {recountMode && showRecountSuggestions && materialCode.trim() && filteredRecountSuggestions.length === 0 && (
+            <div className="absolute z-10 mt-1 w-full rounded-lg border border-line bg-white p-3 text-xs text-ink/50 shadow-lg">
+              Tidak ada material selisih yang cocok.
+            </div>
           )}
         </div>
 
