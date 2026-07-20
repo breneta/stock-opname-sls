@@ -2,6 +2,14 @@
 // reconciled rows grouped by Material + Batch + Plant + Storage Location.
 // This is the ONLY place merging happens — raw entries in so_entries
 // are never updated, only ever appended (per business rule).
+//
+// RECOUNT: when Accounting starts a recount round, new entries for the
+// flagged materials come in tagged with a higher recount_round. For any
+// material that has entries in more than one round, only the entries
+// from its HIGHEST round are used for the total — older rounds stay in
+// the database untouched (audit trail) but are excluded from the sum,
+// so a recount replaces the previous count instead of stacking on top
+// of it.
 
 export function buildReconciliation(sapData, entries) {
   const sapByKey = new Map();
@@ -23,14 +31,12 @@ export function buildReconciliation(sapData, entries) {
         plant: e.plant,
         storage_location: e.storage_location,
         base_uom: e.base_uom,
-        totalQtyFisik: 0,
-        entries: [],
+        allEntries: [],
         statusSap: e.status_sap,
       });
     }
     const g = groups.get(key);
-    g.totalQtyFisik += Number(e.qty_fisik) || 0;
-    g.entries.push(e);
+    g.allEntries.push(e);
     if (e.status_sap === 'tidak_ada_di_sap') g.statusSap = 'tidak_ada_di_sap';
   }
 
@@ -38,7 +44,15 @@ export function buildReconciliation(sapData, entries) {
   for (const g of groups.values()) {
     const sap = sapByKey.get(g.key);
     const qtySap = sap ? Number(sap.qty) : 0;
-    const selisih = g.totalQtyFisik - qtySap;
+
+    // Only entries from the highest recount_round count toward the total.
+    // Round 0 = normal first count. If a recount (round 1, 2, ...) exists
+    // for this material, it fully replaces the earlier round(s).
+    const maxRound = Math.max(...g.allEntries.map((e) => e.recount_round || 0));
+    const activeEntries = g.allEntries.filter((e) => (e.recount_round || 0) === maxRound);
+    const totalQtyFisik = activeEntries.reduce((sum, e) => sum + (Number(e.qty_fisik) || 0), 0);
+
+    const selisih = totalQtyFisik - qtySap;
 
     let status;
     if (g.statusSap === 'tidak_ada_di_sap' || !sap) {
@@ -59,10 +73,16 @@ export function buildReconciliation(sapData, entries) {
       storage_location: g.storage_location || sap?.storage_location || '',
       base_uom: sap?.base_uom || g.base_uom || '',
       qty_sap: qtySap,
-      total_qty_fisik: g.totalQtyFisik,
+      total_qty_fisik: totalQtyFisik,
       selisih,
       status,
-      entries: g.entries.sort((a, b) => new Date(a.created_at) - new Date(b.created_at)),
+      // Recount info for this material
+      recountRound: maxRound,
+      wasRecounted: maxRound > 0,
+      // `entries` = only the entries actually counted in the total (current round).
+      // `allEntriesHistory` = every attempt ever made, for audit/detail view.
+      entries: activeEntries.sort((a, b) => new Date(a.created_at) - new Date(b.created_at)),
+      allEntriesHistory: g.allEntries.sort((a, b) => new Date(a.created_at) - new Date(b.created_at)),
     });
   }
 
