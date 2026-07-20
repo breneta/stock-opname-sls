@@ -17,6 +17,7 @@ export default function SessionHubPage() {
   const [session, setSession] = useState(null);
   const [stats, setStats] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [startingRecount, setStartingRecount] = useState(false);
 
   useEffect(() => {
     load();
@@ -49,11 +50,6 @@ export default function SessionHubPage() {
     const notFoundCount = rows.filter((r) => r.status === 'Tidak Ada di SAP').length;
 
     // --- Per Base Unit of Measure breakdown ---
-    // qtySap        = total target quantity per SAP (scanned + not yet)
-    // qtyBelum      = SAP qty still sitting in un-scanned materials
-    // qtySudah      = qtySap - qtyBelum  -> keeps Sudah + Belum = Total exactly
-    // qtyInput      = actual qty_fisik entered by petugas (real counted amount)
-    // qtyLebih/Kurang = true discrepancy for materials that HAVE been scanned
     const byUom = new Map();
     const getUom = (uom) => {
       const key = uom || '(tanpa satuan)';
@@ -74,9 +70,9 @@ export default function SessionHubPage() {
       if (r.selisih > 0) u.qtyLebih += r.selisih;
       else if (r.selisih < 0) u.qtyKurang += Math.abs(r.selisih);
     }
-    for (const e of entries || []) {
-      if (e.status_sap === 'tidak_ada_di_sap') continue; // tracked separately
-      getUom(e.base_uom).qtyInput += Number(e.qty_fisik) || 0;
+    for (const r of rows) {
+      if (r.status === 'Tidak Ada di SAP') continue; // tracked separately
+      getUom(r.base_uom).qtyInput += r.total_qty_fisik;
     }
 
     const qtyByUom = [...byUom.values()]
@@ -98,8 +94,8 @@ export default function SessionHubPage() {
     // Material-level list of discrepancies, biggest gap first, so
     // Accounting can see exactly which material needs attention without
     // having to open Rekonsiliasi first.
-    const selisihPreview = rows
-      .filter((r) => r.status === 'Lebih' || r.status === 'Kurang')
+    const selisihRows = rows.filter((r) => r.status === 'Lebih' || r.status === 'Kurang');
+    const selisihPreview = [...selisihRows]
       .sort((a, b) => Math.abs(b.selisih) - Math.abs(a.selisih))
       .slice(0, 6);
 
@@ -119,6 +115,8 @@ export default function SessionHubPage() {
       .sort((a, b) => b[1] - a[1])
       .map(([name]) => name);
 
+    const recountedCount = rows.filter((r) => r.wasRecounted).length;
+
     setStats({
       totalMaterialSap,
       materialSudahDiinput,
@@ -127,6 +125,8 @@ export default function SessionHubPage() {
       notFoundCount,
       qtyByUom,
       selisihPreview,
+      selisihMaterialCodes: selisihRows.map((r) => r.material),
+      recountedCount,
       lastUpdate,
       activeOperators,
       hasSapData: (sapData || []).length > 0,
@@ -140,10 +140,59 @@ export default function SessionHubPage() {
     load();
   }
 
+  // Accounting menekan ini setelah lihat ada selisih. Semua material yang
+  // statusnya Lebih/Kurang saat ini dikunci sebagai daftar yang boleh
+  // di-recount. Petugas di halaman Input hanya bisa memilih material dari
+  // daftar ini selama round recount ini masih aktif.
+  async function handleStartRecount() {
+    const materials = stats?.selisihMaterialCodes || [];
+    if (materials.length === 0) {
+      alert('Tidak ada material dengan selisih saat ini.');
+      return;
+    }
+    const nextRound = (session.active_recount_round || 0) + 1;
+    const confirmMsg = `Mulai Recount Round ${nextRound} untuk ${materials.length} material yang selisih?\n\nPetugas hanya bisa input material ini sampai recount selesai.`;
+    if (!confirm(confirmMsg)) return;
+
+    setStartingRecount(true);
+    const { error } = await supabase
+      .from('so_sessions')
+      .update({
+        active_recount_round: nextRound,
+        recount_material_codes: materials,
+      })
+      .eq('id', id);
+
+    if (!error) {
+      await supabase.from('so_recount_rounds').insert({
+        session_id: id,
+        round_number: nextRound,
+        material_codes: materials,
+      });
+    }
+
+    setStartingRecount(false);
+    if (error) {
+      alert('Gagal memulai recount: ' + error.message);
+      return;
+    }
+    load();
+  }
+
+  async function handleStopRecount() {
+    if (!confirm('Selesaikan mode recount? Petugas kembali bisa input semua material seperti biasa.')) return;
+    await supabase
+      .from('so_sessions')
+      .update({ recount_material_codes: [] })
+      .eq('id', id);
+    load();
+  }
+
   if (loading) return <div className="text-sm text-ink/50">Memuat session...</div>;
   if (!session) return <div className="text-sm text-bad">Session tidak ditemukan.</div>;
 
   const totalSelisihAbs = stats?.qtyByUom.reduce((s, u) => s + u.selisihAbs, 0) || 0;
+  const recountActive = (session.recount_material_codes || []).length > 0;
 
   return (
     <div className="space-y-6">
@@ -153,6 +202,9 @@ export default function SessionHubPage() {
           <div className="mt-1 flex items-center gap-2">
             <h1 className="text-xl font-semibold tracking-tight">{session.name}</h1>
             {session.plant && <span className="badge bg-slate-850/10 text-ink">{session.plant}</span>}
+            {session.active_recount_round > 0 && (
+              <span className="badge bg-amber/20 text-warn">Recount Round {session.active_recount_round}</span>
+            )}
           </div>
         </div>
         {session.status === 'active' && (
@@ -187,6 +239,40 @@ export default function SessionHubPage() {
             </Link>
           )}
 
+          {/* ============ RECOUNT PANEL ============ */}
+          {recountActive ? (
+            <div className="card flex items-center justify-between border-warn/40 bg-warn/10 p-4">
+              <div className="text-sm">
+                <div className="font-medium text-warn">
+                  🔄 Recount Round {session.active_recount_round} sedang berjalan
+                </div>
+                <p className="mt-1 text-ink/60">
+                  {(session.recount_material_codes || []).length} material dikunci untuk di-input ulang oleh petugas.
+                  Material lain tidak bisa di-input selama mode ini aktif.
+                </p>
+              </div>
+              <button onClick={handleStopRecount} className="btn-ghost shrink-0 text-xs">Selesaikan Recount</button>
+            </div>
+          ) : (
+            stats.selisihPreview.length > 0 && (
+              <div className="card flex items-center justify-between border-warn/30 bg-warn/5 p-4">
+                <div className="text-sm">
+                  <div className="font-medium text-warn">
+                    {stats.selisihMaterialCodes.length} material ada selisih
+                  </div>
+                  <p className="mt-1 text-ink/60">Minta petugas recount hanya material yang selisih ini.</p>
+                </div>
+                <button
+                  onClick={handleStartRecount}
+                  disabled={startingRecount}
+                  className="btn-amber shrink-0 text-xs disabled:opacity-60"
+                >
+                  {startingRecount ? 'Memulai...' : 'Mulai Recount'}
+                </button>
+              </div>
+            )
+          )}
+
           {/* ============ PROGRESS — the single most important number ============ */}
           <div className="card p-5">
             <div className="mb-2 flex items-center justify-between">
@@ -219,6 +305,12 @@ export default function SessionHubPage() {
                     {stats.activeOperators.length > 0 ? stats.activeOperators.join(', ') : '—'}
                   </span>
                 </span>
+                {stats.recountedCount > 0 && (
+                  <span>
+                    Sudah di-recount:{' '}
+                    <span className="font-medium text-warn">{stats.recountedCount} material</span>
+                  </span>
+                )}
               </span>
             </div>
           </div>
@@ -245,7 +337,7 @@ export default function SessionHubPage() {
             />
             <UomPanel
               title="Material Selisih"
-              tooltip="Total qty yang selisih antara Qty SAP dan Qty hasil stock opname (gabungan Lebih + Kurang), per satuan."
+              tooltip="Total qty yang selisih antara Qty SAP dan Qty hasil stock opname (gabungan Lebih + Kurang), per satuan. Kalau material sudah di-recount, angka ini pakai hasil recount terakhir."
               tone={totalSelisihAbs > 0 ? 'bad' : 'neutral'}
               rows={stats.qtyByUom
                 .filter((u) => u.selisihAbs > 0)
@@ -298,7 +390,7 @@ export default function SessionHubPage() {
               </table>
               <p className="mt-2 text-xs text-ink/40">
                 Qty Input = jumlah fisik yang benar-benar diinput petugas. Selisih = Qty Input − Qty SAP,
-                dihitung dari material yang sudah discan saja.
+                dihitung dari material yang sudah discan saja (pakai hasil recount terakhir kalau ada).
               </p>
             </div>
           )}
@@ -332,6 +424,9 @@ export default function SessionHubPage() {
                       <td className={`py-2 pr-3 text-right font-mono ${r.selisih > 0 ? 'text-warn' : 'text-bad'}`}>{r.selisih > 0 ? '+' : ''}{fmt(r.selisih)}</td>
                       <td className="py-2 pr-3">
                         <span className={`badge ${r.status === 'Lebih' ? 'bg-amber/20 text-warn' : 'bg-bad/10 text-bad'}`}>{r.status}</span>
+                        {r.wasRecounted && (
+                          <span className="badge ml-1 bg-slate-850/10 text-ink/60">recount {r.recountRound}</span>
+                        )}
                       </td>
                     </tr>
                   ))}
