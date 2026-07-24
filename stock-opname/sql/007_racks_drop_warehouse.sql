@@ -1,7 +1,0 @@
--- SUPERSEDED — do not run.
--- This migration was written to drop the warehouse_code requirement on
--- warehouse_racks (1 session = 1 warehouse), but that change was reverted
--- at the user's request — Warehouse Racks upload still requires
--- warehouse_code + rack_code, same as before. Left as a harmless no-op
--- file instead of deleting it, since files already written can't be
--- removed from this folder; nothing here needs to be run.
